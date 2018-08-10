@@ -6,22 +6,21 @@ import java.util.{HashMap => JHashMap}
 import com.google.common.base.Charsets.UTF_8
 import com.google.common.primitives.Shorts
 import com.typesafe.config.ConfigFactory
-import com.wavesplatform.crypto.DigestSize
-import com.wavesplatform.database.DBExt
+import com.wavesplatform.database._
 import com.wavesplatform.db.openDB
 import com.wavesplatform.matcher.api.DBUtils
-import com.wavesplatform.matcher.model.{LimitOrder, OrderInfo}
+import com.wavesplatform.matcher.model.{LimitOrder, OrderBook, OrderInfo}
 import com.wavesplatform.settings.{WavesSettings, loadConfig}
 import com.wavesplatform.state.{ByteStr, EitherExt2}
 import org.iq80.leveldb.DB
 import scorex.account.{Address, AddressScheme}
 import scorex.transaction.AssetId
-import scorex.transaction.assets.exchange.AssetPair
+import scorex.transaction.assets.exchange.{AssetPair, Order}
 import scorex.utils.ScorexLogging
 
 import scala.collection.JavaConverters._
 
-object MigrationTool extends ScorexLogging {
+object MatcherTool extends ScorexLogging {
   private def collectStats(db: DB): Unit = {
     log.info("Collecting stats")
     val iterator = db.iterator()
@@ -66,9 +65,7 @@ object MigrationTool extends ScorexLogging {
   private def deleteLegacyEntries(db: DB): Unit = {
     val keysToDelete = Seq.newBuilder[Array[Byte]]
 
-    db.iterateOver("matcher:".getBytes(UTF_8)) { e =>
-      keysToDelete += e.getKey
-    }
+    db.iterateOver("matcher:".getBytes(UTF_8))(e => keysToDelete += e.getKey)
 
     db.readWrite(rw => keysToDelete.result().foreach(rw.delete))
   }
@@ -78,14 +75,12 @@ object MigrationTool extends ScorexLogging {
     val calculatedReservedBalances = new JHashMap[Address, Map[Option[AssetId], Long]]()
     val ordersToDelete             = Seq.newBuilder[ByteStr]
     val orderInfoToUpdate          = Seq.newBuilder[(ByteStr, OrderInfo)]
-    val key                        = MatcherKeys.orderInfo(ByteStr(Array.emptyByteArray))
 
     var discrepancyCounter = 0
 
-    db.iterateOver(key.keyBytes) { e =>
-      val orderId = ByteStr(new Array[Byte](DigestSize))
-      Array.copy(e.getKey, 2, orderId.arr, 0, DigestSize)
-      val orderInfo = key.parse(e.getValue)
+    db.iterateOver(MatcherKeys.OrderInfoPrefix) { e =>
+      val orderId = e.extractId()
+      val orderInfo = MatcherKeys.decodeOrderInfo(e.getValue)
       if (!orderInfo.status.isFinal) {
         db.get(MatcherKeys.order(orderId)) match {
           case None =>
@@ -184,6 +179,43 @@ object MigrationTool extends ScorexLogging {
     log.info("Completed")
   }
 
+  private def collectActiveOrders(db: DB): Map[AssetPair, Map[ByteStr, Order]] = {
+    val activeOrders = new JHashMap[AssetPair, Map[ByteStr, Order]]()
+    db.iterateOver(MatcherKeys.OrderInfoPrefix) { e =>
+      val info = MatcherKeys.decodeOrderInfo(e.getValue)
+      if (!info.status.isFinal) {
+        val orderId = e.extractId()
+        val order = db.get(MatcherKeys.order(orderId)).get
+        activeOrders.compute(order.assetPair, { (_, maybePrev) =>
+          Option(maybePrev).fold(Map(orderId -> order))(_.updated(orderId, order))
+        })
+      }
+    }
+
+    activeOrders.asScala.toMap
+  }
+
+  private def recoverOrderBooks(db: DB, matcherSnapshotsDirectory: String): Unit = {
+    log.info("Recovering order books")
+    val allActiveOrders = collectActiveOrders(db)
+    val orderBookSnapshots = Map.newBuilder[AssetPair, OrderBook]
+    val snapshotDB = openDB(matcherSnapshotsDirectory)
+    try {
+      snapshotDB.iterateOver(Array(3.toByte)) { e =>
+        // todo: deserialize order book snapshots
+      }
+    } finally {
+      log.info("Closing snapshot store")
+      snapshotDB.close()
+    }
+
+    val allOrderBooks = orderBookSnapshots.result()
+
+    for (assetPair <- allOrderBooks.keySet ++ allActiveOrders.keySet) {
+      // todo: compare order book contents with actual order infos
+    }
+  }
+
   def main(args: Array[String]): Unit = {
     log.info(s"OK, engine start")
 
@@ -195,25 +227,25 @@ object MigrationTool extends ScorexLogging {
       override val chainId: Byte = settings.blockchainSettings.addressSchemeCharacter.toByte
     }
 
-    if (args(1) == "stats") {
-      collectStats(db)
-    } else if (args(1) == "ao") {
-      val o = DBUtils.ordersByAddress(db, Address.fromString(args(2)).explicitGet(), Set.empty, false, Int.MaxValue)
-      println(o.mkString("\n"))
-    } else if (args(1) == "cb") {
-      recalculateReservedBalance(db)
-    } else if (args(1) == "rb") {
-      for ((assetId, balance) <- DBUtils.reservedBalance(db, Address.fromString(args(2)).explicitGet())) {
-        log.info(s"${AssetPair.assetIdStr(assetId)}: $balance")
-      }
-    } else if (args(1) == "ddd") {
-      log.warn("DELETING LEGACY ENTRIES")
-      deleteLegacyEntries(db)
-      log.info("Finished deleting legacy entries")
-    } else if (args(1) == "compact") {
-      log.info("Compacting database")
-      db.compactRange(null, null)
-      log.info("Compaction complete")
+    args(1) match {
+      case "stats" => collectStats(db)
+      case "ao"    => println(DBUtils.ordersByAddress(db, Address.fromString(args(2)).explicitGet(), Set.empty, false, Int.MaxValue).mkString("\n"))
+      case "cb"    => recalculateReservedBalance(db)
+      case "rb" =>
+        for ((assetId, balance) <- DBUtils.reservedBalance(db, Address.fromString(args(2)).explicitGet())) {
+          log.info(s"${AssetPair.assetIdStr(assetId)}: $balance")
+        }
+      case "ddd" =>
+        log.warn("DELETING LEGACY ENTRIES")
+        deleteLegacyEntries(db)
+        log.info("Finished deleting legacy entries")
+      case "compact" =>
+        log.info("Compacting database")
+        db.compactRange(null, null)
+        log.info("Compaction complete")
+      case "recover-orderbooks" =>
+        recoverOrderBooks(db, settings.matcherSettings.snapshotsDataDir)
+      case _ =>
     }
 
     db.close()

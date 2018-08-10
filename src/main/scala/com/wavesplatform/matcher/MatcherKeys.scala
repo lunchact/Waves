@@ -18,16 +18,20 @@ object MatcherKeys {
   val version = intKey(0, default = 1)
 
   def order(orderId: ByteStr): Key[Option[Order]] = Key.opt(bytes(1, orderId.arr), Order.parseBytes(_).get, _.bytes())
-  def orderInfo(orderId: ByteStr): Key[OrderInfo] = Key(
-    bytes(2, orderId.arr),
-    Option(_).fold[OrderInfo](OrderInfo.empty) { b =>
-      val bb = ByteBuffer.wrap(b)
-      b.length match {
-        case 17 => OrderInfo(bb.getLong, bb.getLong, bb.get == 1, None, 0)
-        case 33 => OrderInfo(bb.getLong, bb.getLong, bb.get == 1, Some(bb.getLong), bb.getLong)
-      }
 
-    },
+  val OrderInfoPrefix = 2.toShort
+
+  def decodeOrderInfo(bytes: Array[Byte]): OrderInfo = Option(bytes).fold[OrderInfo](OrderInfo.empty) { b =>
+    val bb = ByteBuffer.wrap(b)
+    b.length match {
+      case 17 => OrderInfo(bb.getLong, bb.getLong, bb.get == 1, None, 0)
+      case 33 => OrderInfo(bb.getLong, bb.getLong, bb.get == 1, Some(bb.getLong), bb.getLong)
+    }
+  }
+
+  def orderInfo(orderId: ByteStr): Key[OrderInfo] = Key(
+    bytes(OrderInfoPrefix, orderId.arr),
+    decodeOrderInfo,
     oi =>
       ByteBuffer
         .allocate(33)
