@@ -1,5 +1,6 @@
 package com.wavesplatform.matcher.market
 
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 
 import akka.actor.{Actor, ActorRef, Props, Terminated}
@@ -23,7 +24,7 @@ import scorex.transaction.assets.exchange.{AssetPair, Order}
 import scorex.utils._
 import scorex.wallet.Wallet
 
-import scala.collection.immutable
+import scala.collection.JavaConverters._
 
 class MatcherActor(orderHistory: ActorRef,
                    pairBuilder: AssetPairBuilder,
@@ -40,7 +41,7 @@ class MatcherActor(orderHistory: ActorRef,
 
   import MatcherActor._
 
-  private var tradedPairs            = Map.empty[AssetPair, MarketData]
+  private val tradedPairs            = new ConcurrentHashMap[AssetPair, MarketData]
   private var lastSnapshotSequenceNr = 0L
 
   private var shutdownStatus: ShutdownStatus = ShutdownStatus(
@@ -81,9 +82,9 @@ class MatcherActor(orderHistory: ActorRef,
   )
 
   def createOrderBook(pair: AssetPair): ActorRef = {
+    tradedPairs.put(pair, createMarketData(pair))
     val orderBook = createOrderBookActor(pair)
     orderBooks.updateAndGet(_ + (pair -> orderBook))
-    tradedPairs += pair -> createMarketData(pair)
     orderBook
   }
 
@@ -123,7 +124,7 @@ class MatcherActor(orderHistory: ActorRef,
 
   def forwardToOrderBook: Receive = {
     case GetMarkets =>
-      sender() ! GetMarketsResponse(getMatcherPublicKey, tradedPairs.values.toSeq)
+      sender() ! GetMarketsResponse(getMatcherPublicKey, tradedPairs.values().asScala.toSeq)
 
     case order: Order =>
       checkAssetPair(order.assetPair, order) {
@@ -159,7 +160,7 @@ class MatcherActor(orderHistory: ActorRef,
 
       context.become(snapshotsCommands orElse shutdownFallback)
 
-      if (lastSnapshotSequenceNr < lastSequenceNr) saveSnapshot(Snapshot(tradedPairs.keySet))
+      if (lastSnapshotSequenceNr < lastSequenceNr) saveSnapshot(Snapshot(tradedPairs.keySet().asScala.toSet))
       else {
         log.debug(s"No changes, lastSnapshotSequenceNr = $lastSnapshotSequenceNr, lastSequenceNr = $lastSequenceNr")
         shutdownStatus = shutdownStatus.copy(
@@ -177,19 +178,19 @@ class MatcherActor(orderHistory: ActorRef,
   }
 
   def initPredefinedPairs(): Unit = {
-    settings.predefinedPairs.filterNot(tradedPairs.contains).foreach(createOrderBook)
+    settings.predefinedPairs.filterNot(tradedPairs.containsKey).foreach(createOrderBook)
   }
 
   private def removeOrderBook(pair: AssetPair): Unit = {
-    if (tradedPairs.contains(pair)) {
-      tradedPairs -= pair
+    if (Option(tradedPairs.remove(pair)).nonEmpty) {
       deleteMessages(lastSequenceNr)
-      persistAll(tradedPairs.map(v => OrderBookCreated(v._1)).to[immutable.Seq])(_ => ())
+      saveSnapshot(Snapshot(tradedPairs.keySet().asScala.toSet))
     }
   }
 
   override def receiveRecover: Receive = {
     case OrderBookCreated(pair) =>
+      log.info(s"OrderBookCreated for $pair")
       if (orderBook(pair).isEmpty) createOrderBook(pair)
 
     case SnapshotOffer(metadata, snapshot: Snapshot) =>
